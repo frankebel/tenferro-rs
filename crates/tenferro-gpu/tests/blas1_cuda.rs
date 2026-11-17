@@ -2,11 +2,11 @@
 
 //! Hardware parity gate for the cuBLAS-backed BLAS1 session hooks.
 //!
-//! `vdot_read`, `norm_squared_read`, and `axpby_read_into_accum` on
-//! [`CudaEngine`] bypass the generic `dot_general`/elementwise composition and
-//! call cuBLAS directly. These tests pin the numerics against the CPU backend,
-//! which keeps the composed reference semantics. They are ignored by default;
-//! explicitly running them requires a CUDA device and fails if none is available.
+//! `vdot_read` on [`CudaEngine`] is one cuBLAS conjugate dot over the operands' compact spans.
+//! `norm_squared_read` and `axpby_read_into_accum` still compose catalogue kernels. These tests
+//! pin the numerics against the CPU backend, which keeps the composed reference semantics. They
+//! are ignored by default; explicitly running them requires a CUDA device and fails if none is
+//! available.
 //!
 //! The conjugation convention in `vdot_read` is the reason this file exists: a
 //! `dotu`-for-`dotc` slip is invisible on real inputs and silently wrong on the
@@ -869,4 +869,253 @@ fn cuda_blas1_handles_empty_inputs() {
     .unwrap();
     let out = download_tensor(cuda.runtime(), &out).unwrap();
     assert!(out.as_slice::<Complex64>().unwrap().is_empty());
+}
+
+/// A `[4, 3]` column-major buffer of distinct `f64` entries: the real-width twin of
+/// [`grid`], seeded so two such buffers cannot accidentally agree.
+fn real_grid(seed: f64) -> Tensor {
+    Tensor::from_vec_col_major(
+        vec![4, 3],
+        (0..12)
+            .map(|i| seed + 0.5 * i as f64 - 0.25 * (i * i) as f64)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+}
+
+/// The transposed `[3, 4]` region of [`real_grid`], as the row-major-strided operand a
+/// reshape-then-transpose hands a sweep.
+fn real_transposed_device_view(tensor: &Tensor) -> TensorRead<'_> {
+    let Some(typed) = tensor.as_typed::<f64>() else {
+        panic!("real-layout tests use F64 tensors")
+    };
+    let view = typed
+        .backend_region_view(vec![3, 4], vec![4, 1], 0)
+        .unwrap();
+    TensorRead::from_view(TensorView::F64(view))
+}
+
+fn real_transposed_host_view(tensor: &Tensor) -> TensorRead<'_> {
+    let view = TypedTensorView::from_slice(
+        vec![3, 4],
+        vec![4_isize, 1],
+        0,
+        tensor.as_slice::<f64>().unwrap(),
+    )
+    .unwrap();
+    TensorRead::from_view(TensorView::F64(view))
+}
+
+/// The last three elements of a length-5 buffer: compact, but starting at a nonzero offset.
+fn real_offset_device_view(tensor: &Tensor) -> TensorRead<'_> {
+    let Some(typed) = tensor.as_typed::<f64>() else {
+        panic!("real-layout tests use F64 tensors")
+    };
+    let view = typed.backend_region_view(vec![3], vec![1], 2).unwrap();
+    TensorRead::from_view(TensorView::F64(view))
+}
+
+fn real_offset_host_view(tensor: &Tensor) -> TensorRead<'_> {
+    let view =
+        TypedTensorView::from_slice(vec![3], vec![1_isize], 2, tensor.as_slice::<f64>().unwrap())
+            .unwrap();
+    TensorRead::from_view(TensorView::F64(view))
+}
+
+/// The transposed `[3, 4]` region of [`real_grid`] as its own compact `[3, 4]` tensor: the
+/// same logical entries the transposed view names, for a cross-layout parity operand.
+fn real_transposed_compact(tensor: &Tensor) -> Tensor {
+    let values = tensor.as_slice::<f64>().unwrap();
+    let mut transposed = vec![0.0_f64; 12];
+    for row in 0..3 {
+        for col in 0..4 {
+            transposed[row + 3 * col] = values[row * 4 + col];
+        }
+    }
+    Tensor::from_vec_col_major(vec![3, 4], transposed).unwrap()
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn cuda_vdot_real_operands_match_cpu_on_strided_and_offset_layouts() {
+    let Some((mut cuda, mut cpu)) = backends() else {
+        return;
+    };
+
+    let host_lhs = real_grid(0.25);
+    let host_rhs = real_grid(-1.5);
+    let lhs = upload_tensor(cuda.runtime(), &host_lhs).unwrap();
+    let rhs = upload_tensor(cuda.runtime(), &host_rhs).unwrap();
+
+    // Both operands transposed: the layout a `dot_general` sweep actually reaches.
+    let expected = cpu
+        .run(|__s| {
+            __s.vdot_read(
+                real_transposed_host_view(&host_lhs),
+                real_transposed_host_view(&host_rhs),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let got = cuda
+        .run(|__s| {
+            __s.vdot_read(
+                real_transposed_device_view(&lhs),
+                real_transposed_device_view(&rhs),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let got = download_tensor(cuda.runtime(), &got).unwrap();
+    assert_close_f64(&got, &expected, "f64 vdot both operands transposed");
+
+    // The value itself, not only CPU agreement: conjugation is the identity here, so the
+    // transposed span must fold to the plain sum of products in transposed order.
+    let (le, re) = (
+        host_lhs.as_slice::<f64>().unwrap(),
+        host_rhs.as_slice::<f64>().unwrap(),
+    );
+    let mut manual = 0.0_f64;
+    for row in 0..3 {
+        for col in 0..4 {
+            manual += le[row * 4 + col] * re[row * 4 + col];
+        }
+    }
+    assert!(
+        (got.as_slice::<f64>().unwrap()[0] - manual).abs() <= 1e-9 * (1.0 + manual.abs()),
+        "f64 transposed vdot is {} but the manual sum is {manual}",
+        got.as_slice::<f64>().unwrap()[0]
+    );
+
+    // Compact views with an offset: the Krylov basis-slice shape.
+    let host_a = Tensor::from_vec_col_major(vec![5], vec![1.5_f64, -2.0, 3.25, 0.5, -4.0]).unwrap();
+    let host_b = Tensor::from_vec_col_major(vec![5], vec![0.25_f64, 2.0, -1.5, 4.5, 0.75]).unwrap();
+    let expected = cpu
+        .run(|__s| {
+            __s.vdot_read(
+                real_offset_host_view(&host_a),
+                real_offset_host_view(&host_b),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let a = upload_tensor(cuda.runtime(), &host_a).unwrap();
+    let b = upload_tensor(cuda.runtime(), &host_b).unwrap();
+    let got = cuda
+        .run(|__s| __s.vdot_read(real_offset_device_view(&a), real_offset_device_view(&b)))
+        .unwrap()
+        .unwrap();
+    let got = download_tensor(cuda.runtime(), &got).unwrap();
+    assert_close_f64(&got, &expected, "f64 vdot both operands offset");
+
+    // An owned compact operand on one side and a strided view on the other keeps one staged
+    // copy and must fold the same way.
+    let host_lhs_compact = real_transposed_compact(&host_lhs);
+    let lhs_compact = upload_tensor(cuda.runtime(), &host_lhs_compact).unwrap();
+    let expected = cpu
+        .run(|__s| {
+            __s.vdot_read(
+                TensorRead::from_tensor(&host_lhs_compact),
+                real_transposed_host_view(&host_rhs),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let got = cuda
+        .run(|__s| {
+            __s.vdot_read(
+                TensorRead::from_tensor(&lhs_compact),
+                real_transposed_device_view(&rhs),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let got = download_tensor(cuda.runtime(), &got).unwrap();
+    assert_close_f64(
+        &got,
+        &expected,
+        "f64 vdot owned lhs against a transposed rhs",
+    );
+}
+
+#[test]
+#[ignore = "requires CUDA"]
+fn cuda_vdot_handles_rank_zero_operands() {
+    let Some((mut cuda, mut cpu)) = backends() else {
+        return;
+    };
+
+    let host_lhs = Tensor::from_vec_col_major(vec![], vec![3.0_f64]).unwrap();
+    let host_rhs = Tensor::from_vec_col_major(vec![], vec![4.0_f64]).unwrap();
+    let expected = cpu
+        .run(|__s| {
+            __s.vdot_read(
+                TensorRead::from_tensor(&host_lhs),
+                TensorRead::from_tensor(&host_rhs),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let lhs = upload_tensor(cuda.runtime(), &host_lhs).unwrap();
+    let rhs = upload_tensor(cuda.runtime(), &host_rhs).unwrap();
+    let got = cuda
+        .run(|__s| __s.vdot_read(TensorRead::from_tensor(&lhs), TensorRead::from_tensor(&rhs)))
+        .unwrap()
+        .unwrap();
+    let got = download_tensor(cuda.runtime(), &got).unwrap();
+    assert_close_f64(&got, &expected, "f64 vdot rank 0");
+    assert_eq!(got.shape(), &[] as &[usize]);
+    assert_eq!(got.as_slice::<f64>().unwrap(), &[12.0]);
+}
+
+/// The fused path is **one** completion wait over compact operands: a re-composed
+/// `conj` -> `mul` -> `reduce` chain takes one per launch, which is the regression this test
+/// exists to catch (#2624). The counter is the engine's own wait boundary, not a launch count:
+/// the destination's zero fill is a memset and does not appear in it.
+#[test]
+#[ignore = "requires CUDA"]
+fn cuda_vdot_is_one_completion_wait_over_compact_operands() {
+    let Some((mut cuda, _)) = backends() else {
+        return;
+    };
+
+    let host =
+        Tensor::from_vec_col_major(vec![1024], (0..1024).map(|i| i as f64).collect()).unwrap();
+    let other = Tensor::from_vec_col_major(
+        vec![1024],
+        (0..1024).map(|i| 1.0 - 0.5 * i as f64).collect(),
+    )
+    .unwrap();
+    let x = upload_tensor(cuda.runtime(), &host).unwrap();
+    let y = upload_tensor(cuda.runtime(), &other).unwrap();
+
+    let before = cuda.launch_completion_syncs();
+    let dot = cuda
+        .run(|__s| __s.vdot_read(TensorRead::from_tensor(&x), TensorRead::from_tensor(&y)))
+        .unwrap()
+        .unwrap();
+    let contiguous_syncs = cuda.launch_completion_syncs() - before;
+    assert_eq!(
+        contiguous_syncs, 1,
+        "a compact vdot must wait once, saw {contiguous_syncs}"
+    );
+    drop(dot);
+
+    // Each strided operand keeps its existing materialization, so the same call costs one wait
+    // per staged operand plus the vendor dot. Anything more is a re-composition.
+    let before = cuda.launch_completion_syncs();
+    let _ = cuda
+        .run(|__s| {
+            __s.vdot_read(
+                real_transposed_device_view(&x),
+                real_transposed_device_view(&y),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let strided_syncs = cuda.launch_completion_syncs() - before;
+    assert_eq!(
+        strided_syncs, 3,
+        "a two-strided-operand vdot stages two copies and then waits once, saw {strided_syncs}"
+    );
 }
